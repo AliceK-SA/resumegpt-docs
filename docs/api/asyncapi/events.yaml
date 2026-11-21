@@ -1,0 +1,554 @@
+asyncapi: 3.0.0
+info:
+  title: ResumeGPT — события и команды
+  version: 1.0.0
+  description: |
+    Все асинхронные сообщения системы в одном файле.
+
+    **Транспорт.** RabbitMQ, topic-exchange `resumegpt.events`; адрес канала = routing key.
+    Очереди: `ai.jobs` (приоритетная, `x-max-priority = 10`), `analysis.inbox`, `billing.inbox`.
+    Все очереди durable, сообщения persistent, публикация с publisher confirms, получение с ручным ack.
+
+    **Гарантии — доставка «как минимум один раз» (at-least-once):**
+    - сервисы с базой (analysis, billing, payment) публикуют через таблицу `outbox`, которая пишется
+      в той же транзакции, что и изменение данных;
+    - получатели с базой хранят `eventId` обработанных сообщений в таблице `inbox`
+      и пропускают повторы;
+    - ai-worker базы не имеет: от повторной обработки задачи его защищает аренда
+      (`POST /internal/analyses/{id}/lease` в analysis-service), а результат публикует напрямую
+      с publisher confirms. Повтор его сообщения отсеет inbox в analysis-service.
+
+    **Порядок** сообщений не гарантируется и не нужен: получатели опираются на текущий статус
+    (условные UPDATE), а не на порядок прихода.
+
+    **Конверт.** Каждое сообщение — JSON с общими полями (`EventEnvelope`) и полем `data`.
+    `eventId` дублируется в AMQP-свойство `message_id`, `correlationId` — в `correlation_id`.
+
+    **Версионирование.** Новые поля добавляются обратно совместимо; несовместимое изменение —
+    новый тип сообщения с суффиксом `.v2`.
+
+    Операции `send` описывают, кто публикует, операции `receive` — кто слушает (сервис указан в тегах).
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: rabbitmq:5672
+    protocol: amqp
+    protocolVersion: 0.9.1
+    description: Брокер в docker-compose
+
+channels:
+  analysisRequested:
+    address: analysis.requested
+    description: |
+      **Команда** воркерам: выполнить анализ. Попадает в приоритетную очередь `ai.jobs`.
+      AMQP-свойство `priority`: 9 для ADVANCED, 1 для BASIC.
+    messages:
+      analysisRequested:
+        $ref: '#/components/messages/AnalysisRequested'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  analysisCompleted:
+    address: analysis.completed
+    description: Воркер успешно выполнил анализ.
+    messages:
+      analysisCompleted:
+        $ref: '#/components/messages/AnalysisCompleted'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  analysisFailed:
+    address: analysis.failed
+    description: |
+      Попытка анализа не удалась. Решение «повторить или сдаться» принимает analysis-service
+      по полю `retryable` и номеру попытки.
+    messages:
+      analysisFailed:
+        $ref: '#/components/messages/AnalysisFailed'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  creditsCommitRequested:
+    address: credits.commit-requested
+    description: "**Команда** billing-service: анализ удался — окончательно списать зарезервированный кредит."
+    messages:
+      creditsCommitRequested:
+        $ref: '#/components/messages/CreditsCommitRequested'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  creditsReleaseRequested:
+    address: credits.release-requested
+    description: "**Команда** billing-service: анализ не удался — вернуть зарезервированный кредит (компенсация)."
+    messages:
+      creditsReleaseRequested:
+        $ref: '#/components/messages/CreditsReleaseRequested'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  paymentSucceeded:
+    address: payment.succeeded
+    description: Оплата покупки прошла — пора зачислять кредиты.
+    messages:
+      paymentSucceeded:
+        $ref: '#/components/messages/PaymentSucceeded'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+  paymentFailed:
+    address: payment.failed
+    description: Оплата покупки не прошла (отказ банка, отмена, истёк срок).
+    messages:
+      paymentFailed:
+        $ref: '#/components/messages/PaymentFailed'
+    bindings:
+      $ref: '#/components/channelBindings/eventsExchange'
+
+operations:
+  # ---------- analysis-service ----------
+  publishAnalysisRequested:
+    action: send
+    channel:
+      $ref: '#/channels/analysisRequested'
+    summary: Поставить задачу в очередь (первая попытка или повтор)
+    tags:
+      - name: analysis-service
+    messages:
+      - $ref: '#/channels/analysisRequested/messages/analysisRequested'
+  analysisReceivesCompleted:
+    action: receive
+    channel:
+      $ref: '#/channels/analysisCompleted'
+    summary: |
+      Сохранить результат: UPDATE ... SET COMPLETED WHERE status = 'PROCESSING' AND attempt = event.attempt AND lease_owner = event.workerId AND lease_token = event.leaseToken AND lease_until >= now().
+      Для ADVANCED — команда credits.commit-requested. Опоздавший результат для уже
+      завершённой заявки игнорируется.
+    tags:
+      - name: analysis-service
+    messages:
+      - $ref: '#/channels/analysisCompleted/messages/analysisCompleted'
+  analysisReceivesFailed:
+    action: receive
+    channel:
+      $ref: '#/channels/analysisFailed'
+    summary: |
+      retryable и попытка < 3 → QUEUED, attempt + 1, новое analysis.requested с задержкой.
+      Иначе → FAILED, для ADVANCED — команда credits.release-requested.
+    tags:
+      - name: analysis-service
+    messages:
+      - $ref: '#/channels/analysisFailed/messages/analysisFailed'
+  publishCreditsCommitRequested:
+    action: send
+    channel:
+      $ref: '#/channels/creditsCommitRequested'
+    tags:
+      - name: analysis-service
+    messages:
+      - $ref: '#/channels/creditsCommitRequested/messages/creditsCommitRequested'
+  publishCreditsReleaseRequested:
+    action: send
+    channel:
+      $ref: '#/channels/creditsReleaseRequested'
+    tags:
+      - name: analysis-service
+    messages:
+      - $ref: '#/channels/creditsReleaseRequested/messages/creditsReleaseRequested'
+
+  # ---------- ai-worker ----------
+  workerReceivesAnalysisRequested:
+    action: receive
+    channel:
+      $ref: '#/channels/analysisRequested'
+    summary: |
+      Арендовать задачу (POST /internal/analyses/{id}/lease). 409 → ack и пропустить.
+      200 → ack, выполнить анализ, опубликовать результат.
+    tags:
+      - name: ai-worker
+    messages:
+      - $ref: '#/channels/analysisRequested/messages/analysisRequested'
+  publishAnalysisCompleted:
+    action: send
+    channel:
+      $ref: '#/channels/analysisCompleted'
+    tags:
+      - name: ai-worker
+    messages:
+      - $ref: '#/channels/analysisCompleted/messages/analysisCompleted'
+  publishAnalysisFailed:
+    action: send
+    channel:
+      $ref: '#/channels/analysisFailed'
+    tags:
+      - name: ai-worker
+    messages:
+      - $ref: '#/channels/analysisFailed/messages/analysisFailed'
+
+  # ---------- billing-service ----------
+  billingReceivesCommit:
+    action: receive
+    channel:
+      $ref: '#/channels/creditsCommitRequested'
+    summary: UPDATE reservations SET COMMITTED WHERE analysis_id = ? AND status = 'RESERVED'
+    tags:
+      - name: billing-service
+    messages:
+      - $ref: '#/channels/creditsCommitRequested/messages/creditsCommitRequested'
+  billingReceivesRelease:
+    action: receive
+    channel:
+      $ref: '#/channels/creditsReleaseRequested'
+    summary: |
+      UPDATE reservations SET RELEASED WHERE analysis_id = ? AND status = 'RESERVED';
+      если обновилась 1 строка — balance + 1 и запись RELEASE в ledger.
+      Если резерва ещё нет, записываем ожидающую компенсацию для analysisId; при позднем резервировании кредит возвращается без повторного списания.
+    tags:
+      - name: billing-service
+    messages:
+      - $ref: '#/channels/creditsReleaseRequested/messages/creditsReleaseRequested'
+  billingReceivesPaymentSucceeded:
+    action: receive
+    channel:
+      $ref: '#/channels/paymentSucceeded'
+    summary: Покупка PENDING → PAID, balance + credits, запись PURCHASE в ledger (уникальна по purchaseId)
+    tags:
+      - name: billing-service
+    messages:
+      - $ref: '#/channels/paymentSucceeded/messages/paymentSucceeded'
+  billingReceivesPaymentFailed:
+    action: receive
+    channel:
+      $ref: '#/channels/paymentFailed'
+    summary: Покупка PENDING → FAILED
+    tags:
+      - name: billing-service
+    messages:
+      - $ref: '#/channels/paymentFailed/messages/paymentFailed'
+
+  # ---------- payment-service ----------
+  publishPaymentSucceeded:
+    action: send
+    channel:
+      $ref: '#/channels/paymentSucceeded'
+    tags:
+      - name: payment-service
+    messages:
+      - $ref: '#/channels/paymentSucceeded/messages/paymentSucceeded'
+  publishPaymentFailed:
+    action: send
+    channel:
+      $ref: '#/channels/paymentFailed'
+    tags:
+      - name: payment-service
+    messages:
+      - $ref: '#/channels/paymentFailed/messages/paymentFailed'
+
+components:
+  channelBindings:
+    eventsExchange:
+      amqp:
+        is: routingKey
+        exchange:
+          name: resumegpt.events
+          type: topic
+          durable: true
+          autoDelete: false
+          vhost: /
+        bindingVersion: 0.3.0
+
+  messages:
+    AnalysisRequested:
+      name: analysis.requested
+      title: Выполнить анализ
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [analysisId, attempt, mode, userId, resumeObjectKey, vacancyUrl]
+                properties:
+                  analysisId:
+                    $ref: '#/components/schemas/Uuid'
+                  attempt:
+                    type: integer
+                    minimum: 1
+                    maximum: 3
+                  mode:
+                    $ref: '#/components/schemas/AnalysisMode'
+                  userId:
+                    $ref: '#/components/schemas/Uuid'
+                  resumeObjectKey:
+                    type: string
+                    description: Путь к файлу в MinIO (в сообщении только ссылка, не сам файл)
+                  vacancyUrl:
+                    type: string
+                    format: uri
+      examples:
+        - name: advanced
+          payload:
+            eventId: 4c1f8a52-0d2e-4b8b-9a3e-7f6d5c4b3a21
+            eventType: analysis.requested
+            occurredAt: '2026-11-20T16:30:00Z'
+            correlationId: 2b7c9e10-5a4d-4f3b-8c2e-1d0f9a8b7c6d
+            producer: analysis-service
+            data:
+              analysisId: 2b7c9e10-5a4d-4f3b-8c2e-1d0f9a8b7c6d
+              attempt: 1
+              mode: ADVANCED
+              userId: 9f1e2d3c-4b5a-4c6d-8e7f-0a1b2c3d4e5f
+              resumeObjectKey: 9f1e2d3c-4b5a-4c6d-8e7f-0a1b2c3d4e5f/2b7c9e10-5a4d-4f3b-8c2e-1d0f9a8b7c6d/Ivanova_CV.pdf
+              vacancyUrl: https://hh.ru/vacancy/123456789
+    AnalysisCompleted:
+      name: analysis.completed
+      title: Анализ выполнен
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [analysisId, attempt, workerId, leaseToken, result, model]
+                properties:
+                  analysisId:
+                    $ref: '#/components/schemas/Uuid'
+                  attempt:
+                    type: integer
+                  workerId:
+                    type: string
+                  leaseToken:
+                    type: string
+                    format: uuid
+                    description: Идентификатор конкретной аренды, выданный analysis-service
+                  model:
+                    type: string
+                  tokensUsed:
+                    type: integer
+                    description: Для учёта расходов на LLM
+                  result:
+                    $ref: '#/components/schemas/AnalysisResult'
+    AnalysisFailed:
+      name: analysis.failed
+      title: Попытка анализа не удалась
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [analysisId, attempt, workerId, leaseToken, reason, retryable]
+                properties:
+                  analysisId:
+                    $ref: '#/components/schemas/Uuid'
+                  attempt:
+                    type: integer
+                  workerId:
+                    type: string
+                  leaseToken:
+                    type: string
+                    format: uuid
+                    description: Идентификатор конкретной аренды, выданный analysis-service
+                  reason:
+                    type: string
+                    description: |
+                      - `VACANCY_NOT_FOUND` — hh.ru вернул 404 (не повторяем)
+                      - `RESUME_UNREADABLE` — текст не извлекается (не повторяем)
+                      - `AI_UNAVAILABLE` — Groq: 5xx, 429 или таймаут после внутренних повторов (повторяем)
+                      - `VACANCY_SOURCE_UNAVAILABLE` — hh.ru: 5xx или таймаут (повторяем)
+                      - `AI_INVALID_RESPONSE` — ответ модели не прошёл проверку схемы (повторяем)
+                    enum: [VACANCY_NOT_FOUND, RESUME_UNREADABLE, AI_UNAVAILABLE, VACANCY_SOURCE_UNAVAILABLE, AI_INVALID_RESPONSE]
+                  retryable:
+                    type: boolean
+                  detail:
+                    type: string
+      examples:
+        - name: groq-rate-limit
+          payload:
+            eventId: 7d2e1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b
+            eventType: analysis.failed
+            occurredAt: '2026-11-20T16:31:40Z'
+            correlationId: 2b7c9e10-5a4d-4f3b-8c2e-1d0f9a8b7c6d
+            producer: ai-worker
+            data:
+              analysisId: 2b7c9e10-5a4d-4f3b-8c2e-1d0f9a8b7c6d
+              attempt: 1
+              workerId: ai-worker-7c9f
+              leaseToken: e1cda31a-310b-4324-8a51-c0a89269d426
+              reason: AI_UNAVAILABLE
+              retryable: true
+              detail: Groq 429 Too Many Requests после 3 внутренних повторов
+    CreditsCommitRequested:
+      name: credits.commit-requested
+      title: Списать кредит
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [analysisId, userId]
+                properties:
+                  analysisId:
+                    $ref: '#/components/schemas/Uuid'
+                  userId:
+                    $ref: '#/components/schemas/Uuid'
+    CreditsReleaseRequested:
+      name: credits.release-requested
+      title: Вернуть кредит
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [analysisId, userId, reason]
+                properties:
+                  analysisId:
+                    $ref: '#/components/schemas/Uuid'
+                  userId:
+                    $ref: '#/components/schemas/Uuid'
+                  reason:
+                    type: string
+                    enum: [VACANCY_NOT_FOUND, RESUME_UNREADABLE, AI_UNAVAILABLE, ATTEMPTS_EXHAUSTED, RESERVATION_TIMEOUT]
+    PaymentSucceeded:
+      name: payment.succeeded
+      title: Оплата прошла
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [paymentId, purchaseId, userId, amount]
+                properties:
+                  paymentId:
+                    $ref: '#/components/schemas/Uuid'
+                  purchaseId:
+                    $ref: '#/components/schemas/Uuid'
+                  userId:
+                    $ref: '#/components/schemas/Uuid'
+                  amount:
+                    $ref: '#/components/schemas/Money'
+      examples:
+        - name: example
+          payload:
+            eventId: 0b8d3c5e-6a43-4c39-9a51-3b7f2f8c1a10
+            eventType: payment.succeeded
+            occurredAt: '2026-11-20T16:20:05Z'
+            correlationId: 6f1c2a9e-1d5b-4f3e-8a7c-2b9d0e4f5a61
+            producer: payment-service
+            data:
+              paymentId: 3a7e9b21-4c8d-4e6f-9b0a-1c2d3e4f5a6b
+              purchaseId: 6f1c2a9e-1d5b-4f3e-8a7c-2b9d0e4f5a61
+              userId: 9f1e2d3c-4b5a-4c6d-8e7f-0a1b2c3d4e5f
+              amount:
+                amountMinor: 7900
+                currency: RUB
+    PaymentFailed:
+      name: payment.failed
+      title: Оплата не прошла
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [data]
+            properties:
+              data:
+                type: object
+                required: [paymentId, purchaseId, reason]
+                properties:
+                  paymentId:
+                    $ref: '#/components/schemas/Uuid'
+                  purchaseId:
+                    $ref: '#/components/schemas/Uuid'
+                  reason:
+                    type: string
+                    enum: [DECLINED_BY_BANK, CANCELED, EXPIRED]
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Money:
+      type: object
+      required: [amountMinor, currency]
+      properties:
+        amountMinor:
+          type: integer
+          format: int64
+          minimum: 0
+        currency:
+          type: string
+          enum: [RUB]
+    AnalysisMode:
+      type: string
+      enum: [BASIC, ADVANCED]
+    EventEnvelope:
+      type: object
+      description: Общие поля любого сообщения
+      required: [eventId, eventType, occurredAt, correlationId, producer]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Уникальный id сообщения — ключ дедупликации в inbox получателя
+        eventType:
+          type: string
+          description: Совпадает с routing key
+        occurredAt:
+          type: string
+          format: date-time
+        correlationId:
+          type: string
+          format: uuid
+          description: analysisId или purchaseId — по нему собираются все логи одного процесса
+        producer:
+          type: string
+          enum: [analysis-service, ai-worker, billing-service, payment-service]
+    AnalysisResult:
+      type: object
+      description: Та же схема, что в OpenAPI analysis-service
+      required: [atsScore, matchedSkills, missingSkills, issues, suggestions]
+      properties:
+        atsScore:
+          type: integer
+          minimum: 0
+          maximum: 100
+        matchedSkills:
+          type: array
+          items:
+            type: string
+        missingSkills:
+          type: array
+          items:
+            type: string
+        issues:
+          type: array
+          items:
+            type: object
+            required: [severity, text]
+            properties:
+              severity:
+                type: string
+                enum: [HIGH, MEDIUM, LOW]
+              text:
+                type: string
+        suggestions:
+          type: array
+          items:
+            type: object
+            required: [original, improved]
+            properties:
+              original:
+                type: string
+              improved:
+                type: string
+        coverLetter:
+          type: string

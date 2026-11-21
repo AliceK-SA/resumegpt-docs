@@ -1,0 +1,85 @@
+site_name: ResumeGPT — документация архитектуры
+site_description: Описание архитектуры (arc42), журнал архитектурных решений (ADR) и справочник API микросервисной системы ResumeGPT
+site_author: Команда CodeCortex
+copyright: Команда «CodeCortex» — Климович А., Петроченко П., Хамадалиева Э.
+
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+  language: ru
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Тёмная тема
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Светлая тема
+
+plugins:
+  - search:
+      lang: [ru, en]
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+nav:
+  - Главная: index.md
+  - Описание архитектуры (arc42):
+      - 1. Введение и цели: arc42/01-introduction-and-goals.md
+      - 2. Ограничения: arc42/02-constraints.md
+      - 3. Контекст и границы: arc42/03-context-and-scope.md
+      - 4. Стратегия решения: arc42/04-solution-strategy.md
+      - 5. Составные части: arc42/05-building-blocks.md
+      - 6. Работа в динамике: arc42/06-runtime.md
+      - 7. Развёртывание: arc42/07-deployment.md
+      - 8. Сквозные концепции: arc42/08-crosscutting-concepts.md
+      - 9. Архитектурные решения: arc42/09-architecture-decisions.md
+      - 10. Требования к качеству: arc42/10-quality.md
+      - 11. Риски и технический долг: arc42/11-risks.md
+      - 12. Глоссарий: arc42/12-glossary.md
+  - Журнал решений (ADR):
+      - Журнал и правила: adr/index.md
+      - ADR-0001. Сага с резервом кредита: adr/0001-saga-with-credit-reservation.md
+      - ADR-0002. Outbox и inbox: adr/0002-outbox-and-idempotent-consumers.md
+      - ADR-0003. RabbitMQ с приоритетами: adr/0003-rabbitmq-priority-queue.md
+      - ADR-0004. Воркер без базы, аренда: adr/0004-stateless-worker-with-lease.md
+      - ADR-0005. База на сервис, MinIO: adr/0005-database-per-service-and-object-storage.md
+      - ADR-0006. Документация как код: adr/0006-docs-as-code.md
+  - Справочник API:
+      - Обзор и соглашения: api/index.md
+      - analysis-service: api/analysis-service.md
+      - billing-service: api/billing-service.md
+      - payment-service: api/payment-service.md
+      - События и команды: api/asyncapi.md
+  - О документации: about.md

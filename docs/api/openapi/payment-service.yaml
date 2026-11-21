@@ -1,0 +1,267 @@
+openapi: 3.0.3
+info:
+  title: ResumeGPT — payment-service
+  version: 1.0.0
+  description: |
+    Платежи через ЮKassa. Единственный сервис, который знает о провайдере (Anti-Corruption Layer):
+    наружу отдаёт только наши статусы. О кредитах и резюме ничего не знает — проводит платёж
+    «по покупке на сумму».
+
+    **Защита от двойного списания и потери оплаты:**
+    1. Один платёж на покупку — уникальный индекс `payments(purchase_id)`. Повторный
+       `POST /payments` по той же покупке возвращает существующий платёж.
+    2. Запрос к ЮKassa отправляется с заголовком `Idempotence-Key = payment.id` — повтор после
+       таймаута не создаёт второй платёж у провайдера.
+    3. Вебхук применяется условным UPDATE (`... WHERE status = 'PENDING'`): повторный вебхук ничего
+       не меняет и событие второй раз не публикует.
+    4. Если вебхук не дошёл, `reconciliation-worker` раз в минуту сам спрашивает ЮKassa о платежах,
+       которые висят в `PENDING` дольше 2 минут.
+
+        Восстановление после неопределённого ответа ЮKassa: наличие локального PENDING не означает,
+        что внешний платёж создан. Повторное обращение с тем же Idempotence-Key до получения
+        providerPaymentId/confirmationUrl безопасно. Reconciliation отдельно обрабатывает
+        записи без providerPaymentId: в пределах первых 24 часов со времени исходного
+        запроса повторяет создание с тем же ключом, затем сверяет статус по известному
+        идентификатору. ЮKassa гарантирует действие ключа лишь 24 часа: по истечении срока
+        без providerPaymentId новый запрос создания автоматически не выполняется, запись
+        переводится на ручную сверку, чтобы не создать дублирующий внешний платёж.
+        Перезапись другого ключа запрещена.
+servers:
+- url: http://payment-service:8080
+  description: Внутренний адрес (docker-compose)
+tags:
+- name: Payments
+  description: Внутренний API для billing-service
+- name: Webhooks
+  description: Уведомления ЮKassa (через API Gateway)
+paths:
+  /payments:
+    post:
+      tags: [Payments]
+      operationId: createPayment
+      summary: Создать платёж по покупке (или вернуть существующий)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+      responses:
+        '200':
+          description: Существующий платёж с подтверждённым внешним идентификатором и ссылкой либо с окончательным 
+            статусом
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '201':
+          description: Платёж создан в ЮKassa
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '422':
+          description: Ошибка валидации
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '502':
+          description: |-
+            Ответ провайдера неизвестен; локальный PENDING будет восстановлен тем же ключом, ссылка пока не возвращается
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - ServiceBearer: []
+      description: "Если по purchaseId есть PENDING без confirmationUrl/providerPaymentId, операция\nне возвращает его
+        как окончательно созданный платёж. Сервис повторяет запрос к ЮKassa с тем\nже `Idempotence-Key=payment.id`, атомарно
+        сохраняет providerPaymentId и confirmationUrl,\nа при неизвестном исходе сохраняет PENDING и планирует восстановление.\n\
+        Для уже созданного платежа возвращается 200 без нового внешнего платежа.\n"
+  /payments/{paymentId}:
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: Платёж по id
+      parameters:
+      - name: paymentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '404':
+          description: Не найдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - ServiceBearer: []
+  /webhooks/yookassa:
+    post:
+      tags: [Webhooks]
+      operationId: handleYookassaWebhook
+      summary: Уведомление ЮKassa о смене статуса платежа
+      description: |
+        1. Проверить, что запрос пришёл с IP-адресов ЮKassa. Иначе — `401`.
+        2. Сохранить уведомление как есть в `provider_notifications`.
+        3. **Не доверять телу:** запросить актуальный статус платежа у ЮKassa по `object.id`.
+        4. Одной транзакцией: условно обновить платёж и записать событие в outbox.
+        5. Ответить `200`. При любом другом ответе ЮKassa повторит уведомление позже —
+           это безопасно благодаря пункту 4.
+
+        Webhook не использует JWT пользователя; проверка источника и независимое чтение статуса из ЮKassa обязательны.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/YookassaNotification'
+      responses:
+        '200':
+          description: Принято (в том числе повторное уведомление)
+        '401':
+          description: Запрос не от ЮKassa
+      security: []
+components:
+  schemas:
+    Money:
+      type: object
+      required: [amountMinor, currency]
+      properties:
+        amountMinor:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 7900
+        currency:
+          type: string
+          enum: [RUB]
+    PaymentStatus:
+      type: string
+      description: |
+        - `PENDING` — создан, ждём оплату
+        - `SUCCEEDED` — деньги получены
+        - `FAILED` — отклонён банком, отменён или истёк
+      enum: [PENDING, SUCCEEDED, FAILED]
+    CreatePaymentRequest:
+      type: object
+      required: [purchaseId, userId, amount, returnUrl]
+      properties:
+        purchaseId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/Money'
+        description:
+          type: string
+          example: ResumeGPT — 10 продвинутых анализов
+        returnUrl:
+          type: string
+          format: uri
+    Payment:
+      type: object
+      required: [id, purchaseId, status, amount, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        purchaseId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        confirmationUrl:
+          type: string
+          format: uri
+          description: Ссылка на страницу оплаты (для PENDING)
+        providerPaymentId:
+          type: string
+          description: id платежа в ЮKassa
+        createdAt:
+          type: string
+          format: date-time
+    YookassaNotification:
+      type: object
+      description: Формат уведомления ЮKassa (упрощённо)
+      required: [type, event, object]
+      properties:
+        type:
+          type: string
+          example: notification
+        event:
+          type: string
+          enum: [payment.succeeded, payment.canceled]
+        object:
+          type: object
+          required: [id, status]
+          properties:
+            id:
+              type: string
+              description: id платежа в ЮKassa
+            status:
+              type: string
+          additionalProperties: true
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+  securitySchemes:
+    UserBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'Публичный вызов: JWT проверяет API Gateway, после чего удаляет клиентский X-User-Id и выставляет
+        проверенный идентификатор'
+    ServiceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: service JWT
+      description: Контрактный механизм межсервисной авторизации; настройка токенов и выдача ключей требуется в 
+        части реализации. Сетевой изоляции недостаточно.

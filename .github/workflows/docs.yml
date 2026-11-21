@@ -1,0 +1,120 @@
+name: Документация
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Проверки и сборка
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Установить зависимости
+        run: pip install -r requirements-docs.txt
+
+      - name: 1. Линтер Markdown
+        uses: DavidAnson/markdownlint-cli2-action@v19
+
+      - name: 2. Валидация OpenAPI
+        run: openapi-spec-validator docs/api/openapi/*.yaml
+
+      - name: 3. Валидация AsyncAPI
+        run: npx --yes @asyncapi/cli@2.17.0 validate docs/api/asyncapi/events.yaml
+
+      - name: 4. Согласованность контрактов
+        run: python scripts/check_specs.py
+
+      - name: 5. Правила контрактов проекта
+        run: |
+          python scripts/check_contract_rules.py
+          npx --yes @stoplight/spectral-cli@6.15.0 lint -r .spectral.yaml docs/api/openapi/*.yaml
+
+      - name: 6. Контроль append-only для принятых ADR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/check_adr_append_only.py
+
+      - name: 7. Актуальность справочника API
+        run: python scripts/gen_api_reference.py --check
+
+      - name: 8. Сборка сайта
+        run: mkdocs build --strict
+
+      - name: Сохранить сайт для публикации
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  report:
+    name: Диаграммы и итоговый отчёт
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Установить зависимости
+        run: |
+          pip install -r requirements-docs.txt
+          npm install --prefix report docx@9.8.1
+          npm install -g @mermaid-js/mermaid-cli@11
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer poppler-utils fonts-liberation
+
+      - name: 9–10. Рендер диаграмм и сборка отчёта
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: bash report/build.sh
+
+      - name: Сохранить отчёт
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: |
+            report/build/report.pdf
+            report/build/report.docx
+
+  deploy:
+    name: Публикация на GitHub Pages
+    needs: [check, report]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

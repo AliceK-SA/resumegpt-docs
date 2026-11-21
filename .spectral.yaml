@@ -1,0 +1,16 @@
+extends: []
+rules:
+  explicit-operation-security:
+    description: Каждая операция должна явно задавать security (или [], если публичная).
+    severity: error
+    given: $.paths.*.*
+    then:
+      field: security
+      function: defined
+  document-operation-responses:
+    description: Для каждой HTTP-операции указываются ответы.
+    severity: error
+    given: $.paths.*.*
+    then:
+      field: responses
+      function: defined

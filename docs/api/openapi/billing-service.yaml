@@ -1,0 +1,436 @@
+openapi: 3.0.3
+info:
+  title: ResumeGPT — billing-service
+  version: 1.0.0
+  description: |
+    Пакеты кредитов, баланс, покупки, резерв кредитов под анализ.
+
+    **Защита кредитов от потери и задвоения:**
+    - баланс не может стать отрицательным — `CHECK (balance >= 0)` в `credit_accounts`;
+    - на один анализ — один резерв: первичный ключ `reservations(analysis_id)`;
+    - списание и возврат — условные переходы `RESERVED → COMMITTED` / `RESERVED → RELEASED`,
+      поэтому выполнить оба или одно дважды невозможно;
+    - за одну покупку кредиты зачисляются один раз — уникальность `ledger(reason, ref_id)`;
+    - каждое движение кредитов записано в журнал `ledger`, баланс всегда сходится с суммой журнала.
+
+    Списание и возврат резерва приходят командами через брокер (см. AsyncAPI),
+    а не HTTP-вызовами, чтобы не потеряться при недоступности сервиса.
+servers:
+- url: http://billing-service:8080
+  description: Внутренний адрес (docker-compose)
+- url: http://localhost:8000/api
+  description: Через API Gateway (только публичные методы)
+tags:
+- name: Credits
+- name: Purchases
+- name: Internal
+  description: Для analysis-service
+paths:
+  /credit-packs:
+    get:
+      tags: [Purchases]
+      operationId: listCreditPacks
+      summary: Доступные пакеты кредитов
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CreditPack'
+      security: []
+  /credits/balance:
+    get:
+      tags: [Credits]
+      operationId: getBalance
+      summary: Баланс кредитов пользователя
+      parameters:
+      - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - UserBearer: []
+  /credits/history:
+    get:
+      tags: [Credits]
+      operationId: getCreditHistory
+      summary: История движений кредитов (журнал)
+      parameters:
+      - $ref: '#/components/parameters/UserId'
+      - name: page
+        in: query
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+      - name: size
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                - page
+                - size
+                - total
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LedgerEntry'
+                  page:
+                    type: integer
+                    minimum: 0
+                  size:
+                    type: integer
+                    minimum: 1
+                  total:
+                    type: integer
+                    minimum: 0
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - UserBearer: []
+  /purchases:
+    post:
+      tags: [Purchases]
+      operationId: createPurchase
+      summary: Купить пакет кредитов
+      description: |
+        Создаёт покупку `PENDING` и вызывает payment-service (`POST /payments`, ключ — `purchaseId`).
+        Возвращает ссылку на страницу оплаты ЮKassa. Кредиты зачисляются после события
+        `payment.succeeded`, не раньше.
+      parameters:
+      - $ref: '#/components/parameters/UserId'
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [packId, returnUrl]
+              properties:
+                packId:
+                  type: string
+                  example: pack-10
+                returnUrl:
+                  type: string
+                  format: uri
+      responses:
+        '201':
+          description: Покупка создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '404':
+          description: Нет такого пакета
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: payment-service недоступен, повторите позже
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - UserBearer: []
+  /purchases/{purchaseId}:
+    get:
+      tags: [Purchases]
+      operationId: getPurchase
+      summary: Статус покупки
+      parameters:
+      - name: purchaseId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '404':
+          description: Не найдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ к ресурсу или операции запрещён
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - UserBearer: []
+  /internal/reservations:
+    post:
+      tags: [Internal]
+      operationId: reserveCredit
+      summary: Зарезервировать кредит под анализ
+      description: |
+        Атомарная идемпотентная операция на одну транзакцию. Сначала блокируется строка счёта
+        `SELECT ... FROM credit_accounts WHERE user_id=:userId FOR UPDATE`. Затем проверяется
+        `reservations(analysis_id)` с уникальным ключом. Если запись уже есть, операция возвращает
+        существующий результат без изменения баланса и ledger. Для новой заявки, не отмеченной
+        ожидающей компенсацией, выполняется условное списание (`UPDATE ... SET balance=balance-1
+        WHERE user_id=:userId AND balance>=1 RETURNING user_id`), после успешного UPDATE создаётся
+        `reservations(..., RESERVED)` и единственная запись `ledger(RESERVE,-1)`.
+        Если для `analysisId` уже зарегистрирована ожидающая компенсация, резерв не создаётся и
+        баланс не уменьшается: ответ сообщает `RELEASED`. Проверка уникальности, блокировка и
+        изменение баланса идут строго в одной транзакции. Никакой отдельный UPDATE не выполняется
+        после `ON CONFLICT DO NOTHING` без проверки результата.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [analysisId, userId]
+              properties:
+                analysisId:
+                  type: string
+                  format: uuid
+                userId:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Повтор или ранее компенсированная заявка; списания нет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '201':
+          description: Кредит зарезервирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '402':
+          description: Недостаточно кредитов
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Токен отсутствует, недействителен или истёк
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - ServiceBearer: []
+components:
+  parameters:
+    UserId:
+      name: X-User-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: 'Заголовок доверенной идентичности. Браузер не задаёт его: API Gateway удаляет входящий X-User-Id
+        и проставляет идентификатор из проверенного JWT. Внутренний сервис принимает его только от доверенного шлюза.'
+      x-internal-gateway-header: true
+  schemas:
+    Money:
+      type: object
+      description: Деньги — целое число копеек, без float
+      required: [amountMinor, currency]
+      properties:
+        amountMinor:
+          type: integer
+          format: int64
+          minimum: 0
+          example: 7900
+        currency:
+          type: string
+          enum: [RUB]
+    CreditPack:
+      type: object
+      required: [id, title, credits, price]
+      properties:
+        id:
+          type: string
+          example: pack-10
+        title:
+          type: string
+          example: Продвинутый — 10 анализов
+        credits:
+          type: integer
+          example: 10
+        price:
+          $ref: '#/components/schemas/Money'
+    Balance:
+      type: object
+      required: [available, reserved]
+      properties:
+        available:
+          type: integer
+          description: Можно потратить прямо сейчас
+          example: 7
+        reserved:
+          type: integer
+          description: Заморожено под анализы, которые ещё идут
+          example: 1
+    Purchase:
+      type: object
+      required: [id, packId, status, price, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        packId:
+          type: string
+        status:
+          type: string
+          description: |
+            - `PENDING` — ждём оплату
+            - `PAID` — оплачено, кредиты зачислены
+            - `FAILED` — оплата не прошла
+          enum: [PENDING, PAID, FAILED]
+        price:
+          $ref: '#/components/schemas/Money'
+        confirmationUrl:
+          type: string
+          format: uri
+          description: Страница оплаты ЮKassa (для PENDING)
+        createdAt:
+          type: string
+          format: date-time
+    Reservation:
+      type: object
+      required: [analysisId, userId, amount, status]
+      properties:
+        analysisId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          example: 1
+        status:
+          type: string
+          enum: [RESERVED, COMMITTED, RELEASED]
+    LedgerEntry:
+      type: object
+      required: [id, delta, reason, refId, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        delta:
+          type: integer
+          description: +10 при покупке, −1 при резерве, +1 при возврате резерва
+        reason:
+          type: string
+          enum: [PURCHASE, RESERVE, RELEASE]
+        refId:
+          type: string
+          format: uuid
+          description: id покупки или анализа
+        createdAt:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+  securitySchemes:
+    UserBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'Публичный вызов: JWT проверяет API Gateway, после чего удаляет клиентский X-User-Id и выставляет
+        проверенный идентификатор'
+    ServiceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: service JWT
+      description: Контрактный механизм межсервисной авторизации; настройка токенов и выдача ключей требуется в 
+        части реализации. Сетевой изоляции недостаточно.
